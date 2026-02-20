@@ -97,5 +97,6 @@ function createDataFileApiPlugin(): Plugin {
 }
 
 export default defineConfig({
+  base: "./",
   plugins: [react(), createDataFileApiPlugin()]
 });

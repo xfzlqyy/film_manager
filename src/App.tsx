@@ -267,6 +267,7 @@ function App() {
   const [formValues, setFormValues] = useState<Record<string, string>>({});
   const [isSaving, setIsSaving] = useState(false);
   const [fileHandle, setFileHandle] = useState<WritableHandle | null>(null);
+  const [deleteCandidate, setDeleteCandidate] = useState<MovieRecord | null>(null);
   const autoSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   const currentCategory = categoriesById[activeCategory];
@@ -574,10 +575,16 @@ function App() {
     setFormValues(preservedValues);
   }
 
-  function handleDelete(record: MovieRecord) {
-    const title = (record.title ?? "").trim();
-    const confirmed = window.confirm(title ? `确认删除「${title}」吗？` : "确认删除这条记录吗？");
-    if (!confirmed) {
+  function requestDelete(record: MovieRecord) {
+    setDeleteCandidate(record);
+  }
+
+  function cancelDelete() {
+    setDeleteCandidate(null);
+  }
+
+  function confirmDelete() {
+    if (!deleteCandidate) {
       return;
     }
 
@@ -585,10 +592,11 @@ function App() {
       ...records,
       [activeCategory]: sortCategoryRecords(
         activeCategory,
-        records[activeCategory].filter((current) => current.id !== record.id)
+        records[activeCategory].filter((current) => current.id !== deleteCandidate.id)
       )
     };
     setRecords(nextAllRecords);
+    setDeleteCandidate(null);
     setStatusMessage("删除成功，正在自动保存...");
     enqueueAutoSave(nextAllRecords, "删除完成");
   }
@@ -771,7 +779,7 @@ function App() {
                   <button type="button" onClick={() => openEditForm(record)}>
                     编辑
                   </button>
-                  <button type="button" onClick={() => handleDelete(record)}>
+                  <button type="button" onClick={() => requestDelete(record)}>
                     删除
                   </button>
                 </td>
@@ -787,6 +795,23 @@ function App() {
           </tbody>
         </table>
       </section>
+
+      {deleteCandidate ? (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title">
+          <div className="modal-panel">
+            <h3 id="delete-dialog-title">确认删除</h3>
+            <p>确认删除「{(deleteCandidate.title ?? "").trim() || "这条记录"}」吗？</p>
+            <div className="modal-actions">
+              <button type="button" className="primary" onClick={confirmDelete}>
+                确认删除
+              </button>
+              <button type="button" onClick={cancelDelete}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

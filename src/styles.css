@@ -195,6 +195,39 @@ td.actions button {
   color: #475569;
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 16px;
+}
+
+.modal-panel {
+  width: min(520px, 100%);
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  padding: 14px;
+}
+
+.modal-panel h3 {
+  margin: 0 0 8px;
+}
+
+.modal-panel p {
+  margin: 0 0 12px;
+  color: #334155;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 8px;
+}
+
 @media (max-width: 900px) {
   .header {
     flex-direction: column;

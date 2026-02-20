@@ -5,6 +5,7 @@ interface FilmLoadResult {
   error?: string;
   canceled?: boolean;
   bytes?: number;
+  warning?: string;
 }
 
 interface FilmManagerApi {

@@ -1,7 +1,7 @@
-import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { categories, categoriesById, createEmptyRecords } from "./config";
 import { buildSearchIndex, createWorkbookBlob, parseWorkbook, sortCategoryRecords } from "./xls";
-import { CategoryId, MovieRecord } from "./types";
+import { CategoryId, CategoryRecords, MovieRecord } from "./types";
 
 const API_DATA_URL = "/api/data.xls";
 const STATIC_DATA_URL = "/data.xls";
@@ -80,6 +80,110 @@ function parseBluraySerial(value: string): { a: number; b: number } | null {
     return null;
   }
   return { a: Number(matched[1]), b: Number(matched[2]) };
+}
+
+function parseChineseDiskNumber(value: string): number | null {
+  const normalized = value.trim();
+  if (!normalized) {
+    return null;
+  }
+
+  if (/^\d+$/.test(normalized)) {
+    return Number(normalized);
+  }
+
+  const digitMap: Record<string, number> = {
+    零: 0,
+    一: 1,
+    二: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9
+  };
+  const unitMap: Record<string, number> = {
+    十: 10,
+    百: 100,
+    千: 1000,
+    万: 10000
+  };
+
+  let total = 0;
+  let section = 0;
+  let digit = 0;
+  let hasValidToken = false;
+
+  for (const char of normalized) {
+    if (char in digitMap) {
+      digit = digitMap[char];
+      hasValidToken = true;
+      continue;
+    }
+
+    const unit = unitMap[char];
+    if (!unit) {
+      return null;
+    }
+    hasValidToken = true;
+
+    if (unit === 10000) {
+      section = (section + (digit || 0)) * unit;
+      total += section;
+      section = 0;
+      digit = 0;
+      continue;
+    }
+
+    section += (digit || 1) * unit;
+    digit = 0;
+  }
+
+  const result = total + section + digit;
+  if (!hasValidToken || Number.isNaN(result)) {
+    return null;
+  }
+  return result;
+}
+
+function parseDiskOrder(diskName: string): number | null {
+  const normalized = diskName.trim();
+  if (!normalized) {
+    return null;
+  }
+
+  const numeric = normalized.match(/(\d+)/);
+  if (numeric) {
+    return Number(numeric[1]);
+  }
+
+  const suffix = normalized.replace(/^硬盘/u, "").trim();
+  return parseChineseDiskNumber(suffix);
+}
+
+function getHighestDiskName(records: MovieRecord[]): string {
+  let bestDisk = "";
+  let bestOrder = -1;
+
+  records.forEach((record) => {
+    const disk = (record.disk ?? "").trim();
+    if (!disk) {
+      return;
+    }
+    const order = parseDiskOrder(disk);
+    if (order !== null && order > bestOrder) {
+      bestOrder = order;
+      bestDisk = disk;
+      return;
+    }
+    if (order === null && !bestDisk) {
+      bestDisk = disk;
+    }
+  });
+
+  return bestDisk;
 }
 
 function getNextIntegerSerial(records: MovieRecord[]): string {
@@ -163,14 +267,23 @@ function App() {
   const [formValues, setFormValues] = useState<Record<string, string>>({});
   const [isSaving, setIsSaving] = useState(false);
   const [fileHandle, setFileHandle] = useState<WritableHandle | null>(null);
+  const autoSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   const currentCategory = categoriesById[activeCategory];
   const categoryRecords = records[activeCategory];
 
   const filteredRecords = useMemo(() => {
-    const keyword = searchValue.trim().toLowerCase();
+    const keyword = searchValue.trim().toLowerCase().replace(/。/g, ".");
     if (!keyword) {
       return categoryRecords;
+    }
+    if (activeCategory === "hdd") {
+      return categoryRecords.filter((record) => {
+        const searchText = `${(record.disk ?? "").trim()}.${(record.serial ?? "").trim()}.${(record.title ?? "").trim()}`
+          .toLowerCase()
+          .replace(/。/g, ".");
+        return searchText.includes(keyword);
+      });
     }
     return categoryRecords.filter((record) => buildSearchIndex(record, activeCategory).includes(keyword));
   }, [activeCategory, categoryRecords, searchValue]);
@@ -180,6 +293,15 @@ function App() {
     categoriesById[nextCategory].fields.forEach((field) => {
       defaultValues[field.key] = "";
     });
+
+    if (nextCategory === "hdd") {
+      const highestDisk = getHighestDiskName(records.hdd);
+      defaultValues.disk = highestDisk;
+      defaultValues.subtitle = "外挂";
+      defaultValues.genre = "mkv";
+      defaultValues.serial = getNextHddSerial(records.hdd, highestDisk);
+    }
+
     setFormValues(defaultValues);
   }
 
@@ -207,6 +329,11 @@ function App() {
     setIsLoading(true);
     setFileHandle(null);
     try {
+      const isElectronRuntime = navigator.userAgent.includes("Electron");
+      if (isElectronRuntime && !window.filmManagerApi) {
+        throw new Error("Electron bridge is unavailable. Please restart app.");
+      }
+
       if (window.filmManagerApi) {
         const result = await window.filmManagerApi.loadData();
         if (result.ok && result.dataBase64) {
@@ -266,6 +393,78 @@ function App() {
     return window.filmManagerApi.saveData(payload);
   }
 
+  async function persistRecords(
+    nextRecords: CategoryRecords,
+    options: {
+      auto: boolean;
+      successMessage: string;
+      fallbackErrorMessage: string;
+    }
+  ): Promise<boolean> {
+    if (!options.auto) {
+      setIsSaving(true);
+    }
+    setErrorMessage("");
+
+    try {
+      const blob = createWorkbookBlob(nextRecords);
+      const savedByElectron = await saveByElectron(blob);
+      if (savedByElectron) {
+        if (savedByElectron.ok) {
+          if (savedByElectron.warning) {
+            setStatusMessage(
+              `${options.successMessage} 已写入 ${savedByElectron.path ?? "data.xls"}，但发生回退：${savedByElectron.warning}`
+            );
+          } else {
+            setStatusMessage(`${options.successMessage} 已持久化到 ${savedByElectron.path ?? "data.xls"}`);
+          }
+          return true;
+        }
+        setErrorMessage(savedByElectron.error ?? "Electron 写入 data.xls 失败。");
+        return false;
+      }
+
+      const savedByApi = await saveByApi(blob);
+      if (savedByApi) {
+        setStatusMessage(`${options.successMessage} 已持久化到 data.xls 和 public/data.xls`);
+        return true;
+      }
+
+      if (fileHandle) {
+        const writable = await fileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        setStatusMessage(`${options.successMessage} 已同步写回 ${fileHandle.name}`);
+        return true;
+      }
+
+      setErrorMessage(options.fallbackErrorMessage);
+      return false;
+    } catch (error) {
+      console.error(error);
+      setErrorMessage(options.fallbackErrorMessage);
+      return false;
+    } finally {
+      if (!options.auto) {
+        setIsSaving(false);
+      }
+    }
+  }
+
+  function enqueueAutoSave(nextRecords: CategoryRecords, actionLabel: string) {
+    autoSaveQueueRef.current = autoSaveQueueRef.current
+      .then(async () => {
+        await persistRecords(nextRecords, {
+          auto: true,
+          successMessage: `${actionLabel}，自动保存成功。`,
+          fallbackErrorMessage: `${actionLabel}后自动保存失败，请检查写入路径权限。`
+        });
+      })
+      .catch((error) => {
+        console.error("[autosave] queue failed", error);
+      });
+  }
+
   useEffect(() => {
     void loadDefaultFile();
     resetForm(DEFAULT_CATEGORY);
@@ -322,7 +521,7 @@ function App() {
   }
 
   function handleFieldChange(fieldKey: string, event: ChangeEvent<HTMLInputElement>) {
-    if (fieldKey === "serial") {
+    if (fieldKey === "serial" && !editingId) {
       return;
     }
     const nextValue = event.target.value;
@@ -345,69 +544,61 @@ function App() {
       nextRecord[field.key] = (formValues[field.key] ?? "").trim();
     });
 
-    setRecords((previous) => {
-      const current = previous[activeCategory];
-      const nextCategoryRecords = editingId
-        ? current.map((record) => (record.id === editingId ? nextRecord : record))
-        : [...current, nextRecord];
-      const sortedCategoryRecords = sortCategoryRecords(activeCategory, nextCategoryRecords);
-
-      return {
-        ...previous,
-        [activeCategory]: sortedCategoryRecords
-      };
-    });
+    const current = records[activeCategory];
+    const nextCategoryRecords = editingId
+      ? current.map((record) => (record.id === editingId ? nextRecord : record))
+      : [...current, nextRecord];
+    const sortedCategoryRecords = sortCategoryRecords(activeCategory, nextCategoryRecords);
+    const nextAllRecords: CategoryRecords = {
+      ...records,
+      [activeCategory]: sortedCategoryRecords
+    };
+    setRecords(nextAllRecords);
 
     setErrorMessage("");
-    setStatusMessage(editingId ? "修改成功，记得保存到 data.xls" : "新增成功，记得保存到 data.xls");
-    setIsFormOpen(false);
-    setEditingId(null);
-    resetForm(activeCategory);
+    if (editingId) {
+      setStatusMessage("修改成功，正在自动保存...");
+      enqueueAutoSave(nextAllRecords, "修改完成");
+      setIsFormOpen(false);
+      setEditingId(null);
+      resetForm(activeCategory);
+      return;
+    }
+
+    setStatusMessage("新增成功，正在自动保存... 可继续新增，点击取消可关闭输入区域。");
+    enqueueAutoSave(nextAllRecords, "新增完成");
+    const preservedValues: Record<string, string> = {};
+    currentCategory.fields.forEach((field) => {
+      preservedValues[field.key] = nextRecord[field.key] ?? "";
+    });
+    setFormValues(preservedValues);
   }
 
-  function handleDelete(recordId: string) {
-    setRecords((previous) => ({
-      ...previous,
+  function handleDelete(record: MovieRecord) {
+    const title = (record.title ?? "").trim();
+    const confirmed = window.confirm(title ? `确认删除「${title}」吗？` : "确认删除这条记录吗？");
+    if (!confirmed) {
+      return;
+    }
+
+    const nextAllRecords: CategoryRecords = {
+      ...records,
       [activeCategory]: sortCategoryRecords(
         activeCategory,
-        previous[activeCategory].filter((record) => record.id !== recordId)
+        records[activeCategory].filter((current) => current.id !== record.id)
       )
-    }));
-    setStatusMessage("删除成功，记得保存到 data.xls");
+    };
+    setRecords(nextAllRecords);
+    setStatusMessage("删除成功，正在自动保存...");
+    enqueueAutoSave(nextAllRecords, "删除完成");
   }
 
   async function handleSave() {
-    setIsSaving(true);
-    setErrorMessage("");
-    try {
-      const blob = createWorkbookBlob(records);
-      const savedByElectron = await saveByElectron(blob);
-      if (savedByElectron) {
-        if (savedByElectron.ok) {
-          setStatusMessage(`已持久化到 ${savedByElectron.path ?? "data.xls"}，刷新后不会丢失`);
-        } else {
-          setErrorMessage(savedByElectron.error ?? "Electron 写入 data.xls 失败。");
-        }
-        return;
-      }
-
-      const savedByApi = await saveByApi(blob);
-      if (savedByApi) {
-        setStatusMessage("已持久化到 data.xls 和 public/data.xls，刷新后不会丢失");
-      } else if (fileHandle) {
-        const writable = await fileHandle.createWritable();
-        await writable.write(blob);
-        await writable.close();
-        setStatusMessage(`已同步写回 ${fileHandle.name}`);
-      } else {
-        setErrorMessage("未能写回 data.xls，请使用 npm run dev/preview 启动，或先选择本地 data.xls 再保存。");
-      }
-    } catch (error) {
-      console.error(error);
-      setErrorMessage("保存 data.xls 失败，请重试。");
-    } finally {
-      setIsSaving(false);
-    }
+    await persistRecords(records, {
+      auto: false,
+      successMessage: "手动保存成功。",
+      fallbackErrorMessage: "保存 data.xls 失败，请检查写入路径权限。"
+    });
   }
 
   function handleExport() {
@@ -515,7 +706,11 @@ function App() {
           type="search"
           value={searchValue}
           onChange={(event) => setSearchValue(event.target.value)}
-          placeholder={`按 ${currentCategory.fields.find((field) => field.key === currentCategory.searchField)?.label ?? "名称"} 等关键字查找`}
+          placeholder={
+            activeCategory === "hdd"
+              ? "按 所属硬盘.序号.电影名 查找，例如 硬盘一.12.盗梦空间"
+              : `按 ${currentCategory.fields.find((field) => field.key === currentCategory.searchField)?.label ?? "名称"} 等关键字查找`
+          }
         />
         <button type="button" className="primary" onClick={openCreateForm}>
           新增记录
@@ -533,7 +728,7 @@ function App() {
                   value={formValues[field.key] ?? ""}
                   onChange={(event) => handleFieldChange(field.key, event)}
                   placeholder={field.placeholder}
-                  readOnly={field.key === "serial"}
+                  readOnly={field.key === "serial" && !editingId}
                 />
               </label>
             ))}
@@ -576,7 +771,7 @@ function App() {
                   <button type="button" onClick={() => openEditForm(record)}>
                     编辑
                   </button>
-                  <button type="button" onClick={() => handleDelete(record.id)}>
+                  <button type="button" onClick={() => handleDelete(record)}>
                     删除
                   </button>
                 </td>
